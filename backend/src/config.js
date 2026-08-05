@@ -10,7 +10,7 @@ const config = {
   qboClientSecret: process.env.QBO_CLIENT_SECRET,
   qboRedirectUri: process.env.QBO_REDIRECT_URI || 'http://localhost:3000/auth/callback',
   qboEnvironment: (process.env.QBO_ENVIRONMENT || 'sandbox').toLowerCase(),
-  tokenStorePath: path.join(__dirname, '../tokens.json'),
+  mongoUri: process.env.MONGODB_URI,
 };
 
 function assertQuickBooksConfig() {

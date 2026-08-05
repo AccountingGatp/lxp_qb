@@ -30,13 +30,22 @@ app.get('/health', (_req, res) => {
   });
 });
 
-app.get('/auth/status', (_req, res) => {
-  const tokens = loadTokens();
-  res.json({
-    connected: Boolean(tokens),
-    realmId: tokens?.realmId || null,
-    environment: config.qboEnvironment,
-  });
+app.get('/auth/status', async (_req, res) => {
+  try {
+    const tokens = await loadTokens();
+    res.json({
+      connected: Boolean(tokens),
+      realmId: tokens?.realmId || null,
+      environment: config.qboEnvironment,
+    });
+  } catch (error) {
+    res.status(500).json({
+      connected: false,
+      realmId: null,
+      environment: config.qboEnvironment,
+      error: error.message,
+    });
+  }
 });
 
 app.get('/auth/connect', (_req, res) => {
@@ -55,7 +64,7 @@ app.get('/auth/callback', async (req, res) => {
     const token = authResponse.getToken();
     const realmId = req.query.realmId || token.realmId;
 
-    saveTokens({ ...token, realmId });
+    await saveTokens({ ...token, realmId });
 
     const redirectTo = new URL(config.frontendOrigin);
     redirectTo.searchParams.set('connected', '1');
@@ -71,7 +80,8 @@ app.get('/auth/callback', async (req, res) => {
 
 app.post('/api/uploads/xlsx', upload.single('file'), async (req, res) => {
   try {
-    if (!loadTokens()) {
+    const tokens = await loadTokens();
+    if (!tokens) {
       return res.status(401).json({
         ok: false,
         error: 'Connect QuickBooks before uploading a file.',

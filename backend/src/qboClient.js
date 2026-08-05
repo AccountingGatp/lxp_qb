@@ -27,7 +27,7 @@ function formatQboError(error) {
 
   if (String(code) === '401') {
     const err = new Error(
-      'QuickBooks authorization expired (401). Open http://localhost:3000/auth/connect and reconnect the sandbox company.'
+      'QuickBooks authorization expired (401). Open /auth/connect and reconnect the sandbox company.'
     );
     err.code = '401';
     err.fault = error.fault || null;
@@ -43,11 +43,9 @@ function formatQboError(error) {
 }
 
 async function getAuthorizedClient({ forceRefresh = false } = {}) {
-  const stored = loadTokens();
+  const stored = await loadTokens();
   if (!stored) {
-    throw new Error(
-      'No saved tokens. Open http://localhost:3000/auth/connect and authorize a sandbox company.'
-    );
+    throw new Error('No saved tokens. Open /auth/connect and authorize a sandbox company.');
   }
 
   const oauthClient = createOAuthClient();
@@ -67,7 +65,10 @@ async function getAuthorizedClient({ forceRefresh = false } = {}) {
     try {
       const refreshResponse = await oauthClient.refreshUsingToken(stored.refresh_token);
       const refreshed = refreshResponse.getJson();
-      const saved = saveTokens({ ...refreshed, realmId: refreshed.realmId || stored.realmId });
+      const saved = await saveTokens({
+        ...refreshed,
+        realmId: refreshed.realmId || stored.realmId,
+      });
 
       activeToken = {
         access_token: saved.access_token,
