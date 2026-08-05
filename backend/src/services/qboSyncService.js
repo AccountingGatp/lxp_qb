@@ -228,7 +228,42 @@ function buildBillPayload(parsedFile, vendorId, itemMap, nonTaxableCode) {
   return payload;
 }
 
+async function findBillByDocNumber(docNumber) {
+  if (!docNumber) {
+    return null;
+  }
+
+  return queryOne('Bill', `DocNumber = '${escapeQboValue(docNumber)}'`);
+}
+
+async function assertInvoiceNumberIsUnique(ref) {
+  const invoiceNumber = String(ref || '').trim();
+  if (!invoiceNumber) {
+    const error = new Error('Invoice number (Ref #) is required and must be unique.');
+    error.errors = ['Missing Ref # / invoice number in the sheet header.'];
+    throw error;
+  }
+
+  const existing = await findBillByDocNumber(invoiceNumber);
+  if (existing) {
+    const error = new Error(
+      `Invoice number "${invoiceNumber}" already exists in QuickBooks (Bill Id ${existing.Id}). Do not upload the same invoice again.`
+    );
+    error.errors = [
+      `Duplicate invoice number: ${invoiceNumber}`,
+      `Existing Bill Id: ${existing.Id}`,
+      `Existing Bill Date: ${existing.TxnDate || '-'}`,
+      `Existing Bill Total: ${existing.TotalAmt ?? '-'}`,
+    ];
+    throw error;
+  }
+
+  return invoiceNumber;
+}
+
 async function createBillFromParsedFile(parsedFile) {
+  await assertInvoiceNumberIsUnique(parsedFile.header.ref);
+
   const { vendor, created: vendorCreated } = await findOrCreateVendor(parsedFile.header.vendor);
   const {
     itemMap,
