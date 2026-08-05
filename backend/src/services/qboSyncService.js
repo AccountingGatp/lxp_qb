@@ -113,7 +113,7 @@ async function createInventoryItem(row, accounts, inventoryStartDate) {
     ExpenseAccountRef: { value: String(accounts.expenseAccount.Id) },
     AssetAccountRef: { value: String(accounts.assetAccount.Id) },
     TrackQtyOnHand: true,
-    QtyOnHand: row.quantity,
+    QtyOnHand: 0,
     InvStartDate: inventoryStartDate,
     "TaxClassificationRef": {
       "value": "EUC-99990101-V1-00020000"
