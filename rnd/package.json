@@ -1,0 +1,19 @@
+{
+  "name": "qbo-rnd",
+  "version": "1.0.0",
+  "private": true,
+  "description": "QuickBooks Online sandbox R&D — create bill with dummy data",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "create-bill": "node src/createBill.js",
+    "list-bills": "node src/listBills.js",
+    "create-inventory": "node src/createInventory.js",
+    "list-inventory": "node src/listInventory.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "intuit-oauth": "^4.1.2"
+  }
+}
