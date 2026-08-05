@@ -104,6 +104,10 @@ async function findInventoryItemBySku(sku) {
 async function createInventoryItem(row, accounts, inventoryStartDate) {
   // US QuickBooks: Taxable=false is the supported way to mark inventory non-taxable.
   // Do not send SalesTaxCodeRef: "NON" — that causes ValidationFault 2090 Invalid Number.
+  const asOfDate =
+    inventoryStartDate ||
+    `${new Date().getUTCFullYear()}-${String(new Date().getUTCMonth() + 1).padStart(2, '0')}-01`;
+
   const payload = {
     Name: row.productName || row.sku,
     Sku: row.sku,
@@ -113,14 +117,14 @@ async function createInventoryItem(row, accounts, inventoryStartDate) {
     ExpenseAccountRef: { value: String(accounts.expenseAccount.Id) },
     AssetAccountRef: { value: String(accounts.assetAccount.Id) },
     TrackQtyOnHand: true,
+    // Always create with zero opening stock; bill lines will receive qty later.
     QtyOnHand: 0,
-    InvStartDate: inventoryStartDate,
-    "TaxClassificationRef": {
-      "value": "EUC-99990101-V1-00020000"
-   }
- 
-    // UnitPrice: 0,
-    // PurchaseCost: 0,
+    InvStartDate: asOfDate,
+    UnitPrice: 0,
+    PurchaseCost: 0,
+    TaxClassificationRef: {
+      value: 'EUC-99990101-V1-00020000',
+    },
   };
 
   const response = await qboRequest('POST', '/item', payload);
@@ -188,29 +192,28 @@ async function ensureInventoryItems(rows, inventoryStartDate) {
     reusedItems,
     updatedTaxItems,
     nonTaxableCode,
+    accounts,
   };
 }
 
-function buildBillPayload(parsedFile, vendorId, itemMap, nonTaxableCode) {
+function buildBillPayload(parsedFile, vendorId, expenseAccountId, nonTaxableCode) {
+  // Use account-based lines so the bill does NOT increase inventory Qty on hand.
+  // Inventory items are still created separately with QtyOnHand = 0.
   const lineItems = parsedFile.rows.map((row) => {
-    const item = itemMap.get(row.sku);
     const detail = {
-      ItemRef: { value: String(item.Id) },
-      Qty: row.quantity,
-      UnitPrice: row.cost,
+      AccountRef: { value: String(expenseAccountId) },
       BillableStatus: 'NotBillable',
     };
 
-    // Only attach TaxCodeRef when QBO returned a real numeric tax-code Id.
     if (nonTaxableCode?.Id && /^\d+$/.test(String(nonTaxableCode.Id))) {
       detail.TaxCodeRef = { value: String(nonTaxableCode.Id) };
     }
 
     return {
       Amount: row.amount,
-      Description: row.productName || row.sku,
-      DetailType: 'ItemBasedExpenseLineDetail',
-      ItemBasedExpenseLineDetail: detail,
+      Description: `${row.sku} | ${row.productName || ''} | Qty ${row.quantity} @ ${row.cost}`,
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: detail,
     };
   });
 
@@ -271,11 +274,17 @@ async function createBillFromParsedFile(parsedFile) {
     reusedItems,
     updatedTaxItems,
     nonTaxableCode,
+    accounts,
   } = await ensureInventoryItems(
     parsedFile.rows,
     parsedFile.header.inventoryStartDate || parsedFile.header.date
   );
-  const billPayload = buildBillPayload(parsedFile, vendor.Id, itemMap, nonTaxableCode);
+  const billPayload = buildBillPayload(
+    parsedFile,
+    vendor.Id,
+    accounts.expenseAccount.Id,
+    nonTaxableCode
+  );
   const billResponse = await qboRequest('POST', '/bill', billPayload);
   const bill = billResponse.Bill;
 
