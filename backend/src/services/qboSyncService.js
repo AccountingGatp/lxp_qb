@@ -146,7 +146,7 @@ async function createInventoryItem(row, accounts, inventoryStartDate) {
     ExpenseAccountRef: { value: String(accounts.expenseAccount.Id) },
     AssetAccountRef: { value: String(accounts.assetAccount.Id) },
     TrackQtyOnHand: true,
-    // Always create with zero opening stock; bill lines will receive qty later.
+    // Inventory must stay at zero — bill uses account lines and does not receive stock.
     QtyOnHand: 0,
     InvStartDate: asOfDate,
     UnitPrice: Number(row.unitPrice) || 0,
@@ -154,7 +154,15 @@ async function createInventoryItem(row, accounts, inventoryStartDate) {
   };
 
   const response = await qboRequest('POST', '/item', payload);
-  return response.Item;
+  const item = response.Item;
+
+  if (item && Number(item.QtyOnHand) !== 0) {
+    throw new Error(
+      `Inventory item for SKU ${sku} was created with QtyOnHand=${item.QtyOnHand}; expected 0.`
+    );
+  }
+
+  return item;
 }
 
 async function sparseUpdateItem(item, fields) {
@@ -255,6 +263,7 @@ async function ensureInventoryItems(rows, inventoryStartDate) {
       itemId: created.Id,
       name: created.Name,
       itemSku: created.Sku || row.sku,
+      qtyOnHand: Number(created.QtyOnHand) || 0,
       taxable: false,
     });
   }
@@ -269,22 +278,12 @@ async function ensureInventoryItems(rows, inventoryStartDate) {
   };
 }
 
-function buildBillPayload(parsedFile, vendorId, itemMap, nonTaxableCode) {
-  // Use Product/Service (item) lines — not Category/account lines.
+function buildBillPayload(parsedFile, vendorId, expenseAccountId, nonTaxableCode) {
+  // Account-based lines only — ItemBasedExpenseLineDetail would increase QtyOnHand.
+  // Inventory items are still created/updated separately with Sku and QtyOnHand = 0.
   const lineItems = parsedFile.rows.map((row) => {
-    const item = itemMap.get(row.sku);
-    if (!item?.Id) {
-      throw new Error(`Missing QuickBooks item for SKU ${row.sku}`);
-    }
-
     const detail = {
-      // ItemRef points at the inventory item that carries the sheet SKU.
-      ItemRef: {
-        value: String(item.Id),
-        name: String(item.Name || row.sku),
-      },
-      Qty: row.quantity,
-      UnitPrice: row.cost,
+      AccountRef: { value: String(expenseAccountId) },
       BillableStatus: 'NotBillable',
     };
 
@@ -294,10 +293,9 @@ function buildBillPayload(parsedFile, vendorId, itemMap, nonTaxableCode) {
 
     return {
       Amount: row.amount,
-      // Keep SKU visible on the bill line description as well.
-      Description: `${row.sku} | ${row.productName || ''}`.trim(),
-      DetailType: 'ItemBasedExpenseLineDetail',
-      ItemBasedExpenseLineDetail: detail,
+      Description: `${row.sku} | ${row.productName || ''} | Qty ${row.quantity} @ ${row.cost}`,
+      DetailType: 'AccountBasedExpenseLineDetail',
+      AccountBasedExpenseLineDetail: detail,
     };
   });
 
@@ -353,16 +351,21 @@ async function createBillFromParsedFile(parsedFile) {
 
   const { vendor, created: vendorCreated } = await findOrCreateVendor(parsedFile.header.vendor);
   const {
-    itemMap,
     createdItems,
     reusedItems,
     updatedTaxItems,
     nonTaxableCode,
+    accounts,
   } = await ensureInventoryItems(
     parsedFile.rows,
     parsedFile.header.inventoryStartDate || parsedFile.header.date
   );
-  const billPayload = buildBillPayload(parsedFile, vendor.Id, itemMap, nonTaxableCode);
+  const billPayload = buildBillPayload(
+    parsedFile,
+    vendor.Id,
+    accounts.expenseAccount.Id,
+    nonTaxableCode
+  );
   const billResponse = await qboRequest('POST', '/bill', billPayload);
   const bill = billResponse.Bill;
 
