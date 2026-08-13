@@ -293,7 +293,7 @@ function buildBillPayload(parsedFile, vendorId, expenseAccountId, nonTaxableCode
 
     return {
       Amount: row.amount,
-      Description: `${row.sku} | ${row.productName || ''} | Qty ${row.quantity} @ ${row.cost}`,
+      Description: '',
       DetailType: 'AccountBasedExpenseLineDetail',
       AccountBasedExpenseLineDetail: detail,
     };
