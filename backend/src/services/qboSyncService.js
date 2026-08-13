@@ -91,26 +91,55 @@ async function getNonTaxableCode() {
   }
 }
 
-async function findInventoryItemBySku(sku) {
-  const bySku = await queryOne('Item', `Sku = '${escapeQboValue(sku)}'`);
-  if (bySku) {
-    return bySku;
+async function findInventoryItem(row) {
+  const sku = String(row.sku || '').trim();
+  const productName = String(row.productName || '').trim();
+
+  if (sku) {
+    const bySku = await queryOne('Item', `Sku = '${escapeQboValue(sku)}'`);
+    if (bySku) {
+      return bySku;
+    }
+
+    // Items may have been created with Name = SKU.
+    const byNameSku = await queryOne('Item', `Name = '${escapeQboValue(sku)}'`);
+    if (byNameSku) {
+      return byNameSku;
+    }
   }
 
-  // Fallback: older items may have been created with Name = SKU.
-  return queryOne('Item', `Name = '${escapeQboValue(sku)}'`);
+  // Older uploads used product name as Item.Name with no Sku field.
+  if (productName) {
+    const byProductName = await queryOne('Item', `Name = '${escapeQboValue(productName)}'`);
+    if (byProductName) {
+      return byProductName;
+    }
+  }
+
+  return null;
+}
+
+async function refetchItem(itemId) {
+  return queryOne('Item', `Id = '${escapeQboValue(String(itemId))}'`);
 }
 
 async function createInventoryItem(row, accounts, inventoryStartDate) {
   // US QuickBooks: Taxable=false is the supported way to mark inventory non-taxable.
   // Do not send SalesTaxCodeRef: "NON" — that causes ValidationFault 2090 Invalid Number.
+  // Do not send TaxClassificationRef — that is locale-specific and breaks US sandbox.
   const asOfDate =
     inventoryStartDate ||
     `${new Date().getUTCFullYear()}-${String(new Date().getUTCMonth() + 1).padStart(2, '0')}-01`;
 
+  const sku = String(row.sku).trim();
+  const productName = String(row.productName || sku).trim();
+
   const payload = {
-    Name: row.productName || row.sku,
-    Sku: row.sku,
+    // Put sheet SKU on the item itself (Name + Sku) so bill Product/Service shows the SKU.
+    Name: sku,
+    Sku: sku,
+    Description: productName,
+    PurchaseDesc: productName,
     Type: 'Inventory',
     Taxable: false,
     IncomeAccountRef: { value: String(accounts.incomeAccount.Id) },
@@ -120,15 +149,55 @@ async function createInventoryItem(row, accounts, inventoryStartDate) {
     // Always create with zero opening stock; bill lines will receive qty later.
     QtyOnHand: 0,
     InvStartDate: asOfDate,
-    UnitPrice: 0,
-    PurchaseCost: 0,
-    TaxClassificationRef: {
-      value: 'EUC-99990101-V1-00020000',
-    },
+    UnitPrice: Number(row.unitPrice) || 0,
+    PurchaseCost: Number(row.cost) || 0,
   };
 
   const response = await qboRequest('POST', '/item', payload);
   return response.Item;
+}
+
+async function sparseUpdateItem(item, fields) {
+  const response = await qboRequest('POST', `/item?operation=update`, {
+    Id: item.Id,
+    SyncToken: item.SyncToken,
+    sparse: true,
+    ...fields,
+  });
+
+  if (response?.Item?.Id) {
+    return response.Item;
+  }
+
+  // Sparse update can return incomplete bodies; always re-read for a fresh SyncToken.
+  const refreshed = await refetchItem(item.Id);
+  return refreshed || { ...item, ...fields };
+}
+
+async function ensureItemHasSku(item, sku, productName) {
+  const wantedSku = String(sku || '').trim();
+  const wantedName = String(productName || wantedSku).trim();
+  const currentSku = String(item.Sku || '').trim();
+  const currentDesc = String(item.Description || '').trim();
+  const currentPurchaseDesc = String(item.PurchaseDesc || '').trim();
+
+  const fields = {};
+  if (wantedSku && currentSku !== wantedSku) {
+    fields.Sku = wantedSku;
+  }
+  if (wantedName && !currentDesc) {
+    fields.Description = wantedName;
+  }
+  if (wantedName && !currentPurchaseDesc) {
+    fields.PurchaseDesc = wantedName;
+  }
+
+  if (!Object.keys(fields).length) {
+    return { item, updated: false };
+  }
+
+  const updatedItem = await sparseUpdateItem(item, fields);
+  return { item: updatedItem, updated: true };
 }
 
 async function ensureItemIsNonTaxable(item) {
@@ -136,14 +205,8 @@ async function ensureItemIsNonTaxable(item) {
     return { item, updated: false };
   }
 
-  const response = await qboRequest('POST', `/item?operation=update`, {
-    Id: item.Id,
-    SyncToken: item.SyncToken,
-    sparse: true,
-    Taxable: false,
-  });
-
-  return { item: response.Item || item, updated: true };
+  const updatedItem = await sparseUpdateItem(item, { Taxable: false });
+  return { item: updatedItem, updated: true };
 }
 
 async function ensureInventoryItems(rows, inventoryStartDate) {
@@ -159,18 +222,27 @@ async function ensureInventoryItems(rows, inventoryStartDate) {
       continue;
     }
 
-    const existing = await findInventoryItemBySku(row.sku);
+    const existing = await findInventoryItem(row);
     if (existing) {
-      const { item, updated } = await ensureItemIsNonTaxable(existing);
+      let item = existing;
+
+      const taxResult = await ensureItemIsNonTaxable(item);
+      item = taxResult.item;
+
+      const skuResult = await ensureItemHasSku(item, row.sku, row.productName);
+      item = skuResult.item;
+
       itemMap.set(row.sku, item);
       reusedItems.push({
         sku: row.sku,
         itemId: item.Id,
         name: item.Name,
+        itemSku: item.Sku || row.sku,
         taxable: false,
-        taxUpdated: updated,
+        taxUpdated: taxResult.updated,
+        skuUpdated: skuResult.updated,
       });
-      if (updated) {
+      if (taxResult.updated) {
         updatedTaxItems.push({ sku: row.sku, itemId: item.Id });
       }
       continue;
@@ -182,6 +254,7 @@ async function ensureInventoryItems(rows, inventoryStartDate) {
       sku: row.sku,
       itemId: created.Id,
       name: created.Name,
+      itemSku: created.Sku || row.sku,
       taxable: false,
     });
   }
@@ -196,12 +269,22 @@ async function ensureInventoryItems(rows, inventoryStartDate) {
   };
 }
 
-function buildBillPayload(parsedFile, vendorId, expenseAccountId, nonTaxableCode) {
-  // Use account-based lines so the bill does NOT increase inventory Qty on hand.
-  // Inventory items are still created separately with QtyOnHand = 0.
+function buildBillPayload(parsedFile, vendorId, itemMap, nonTaxableCode) {
+  // Use Product/Service (item) lines — not Category/account lines.
   const lineItems = parsedFile.rows.map((row) => {
+    const item = itemMap.get(row.sku);
+    if (!item?.Id) {
+      throw new Error(`Missing QuickBooks item for SKU ${row.sku}`);
+    }
+
     const detail = {
-      AccountRef: { value: String(expenseAccountId) },
+      // ItemRef points at the inventory item that carries the sheet SKU.
+      ItemRef: {
+        value: String(item.Id),
+        name: String(item.Name || row.sku),
+      },
+      Qty: row.quantity,
+      UnitPrice: row.cost,
       BillableStatus: 'NotBillable',
     };
 
@@ -211,9 +294,10 @@ function buildBillPayload(parsedFile, vendorId, expenseAccountId, nonTaxableCode
 
     return {
       Amount: row.amount,
-      Description: `${row.sku} | ${row.productName || ''} | Qty ${row.quantity} @ ${row.cost}`,
-      DetailType: 'AccountBasedExpenseLineDetail',
-      AccountBasedExpenseLineDetail: detail,
+      // Keep SKU visible on the bill line description as well.
+      Description: `${row.sku} | ${row.productName || ''}`.trim(),
+      DetailType: 'ItemBasedExpenseLineDetail',
+      ItemBasedExpenseLineDetail: detail,
     };
   });
 
@@ -274,17 +358,11 @@ async function createBillFromParsedFile(parsedFile) {
     reusedItems,
     updatedTaxItems,
     nonTaxableCode,
-    accounts,
   } = await ensureInventoryItems(
     parsedFile.rows,
     parsedFile.header.inventoryStartDate || parsedFile.header.date
   );
-  const billPayload = buildBillPayload(
-    parsedFile,
-    vendor.Id,
-    accounts.expenseAccount.Id,
-    nonTaxableCode
-  );
+  const billPayload = buildBillPayload(parsedFile, vendor.Id, itemMap, nonTaxableCode);
   const billResponse = await qboRequest('POST', '/bill', billPayload);
   const bill = billResponse.Bill;
 

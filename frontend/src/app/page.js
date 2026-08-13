@@ -22,9 +22,9 @@ import {
 } from "@/components/ui/table";
 
 const API_BASE_URL =
-"https://lxp-qb-api.vercel.app"
+// "https://lxp-qb-api.vercel.app"
 
-  // process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:3000";
+  process.env.NEXT_PUBLIC_API_BASE_URL || "http://localhost:3000";
 
 function formatCurrency(value) {
   if (value === null || value === undefined || Number.isNaN(Number(value))) {
@@ -289,6 +289,14 @@ export default function Home() {
                 <CardContent className="space-y-1 text-sm">
                   <p>Created: {result.sync.createdItems.length}</p>
                   <p>Reused: {result.sync.reusedItems.length}</p>
+                  <p>
+                    SKU updated:{" "}
+                    {
+                      (result.sync.reusedItems || []).filter(
+                        (item) => item.skuUpdated
+                      ).length
+                    }
+                  </p>
                   <p>Rows: {result.sync.payloadSummary.totalRows}</p>
                   <p>
                     Tax:{" "}

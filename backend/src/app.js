@@ -4,7 +4,7 @@ const multer = require('multer');
 const { config } = require('./config');
 const { createOAuthClient } = require('./qboClient');
 const { saveTokens, loadTokens } = require('./tokenStore');
-const { parseWorkbook } = require('./services/xlsxParser');
+const { parseWorkbook, SheetValidationError } = require('./services/xlsxParser');
 const { createBillFromParsedFile } = require('./services/qboSyncService');
 
 const upload = multer({
@@ -116,7 +116,11 @@ app.post('/api/uploads/xlsx', upload.single('file'), async (req, res) => {
 
     console.error('Upload failed:', details, error.fault || '');
 
-    return res.status(Number(error.code) === 401 ? 401 : 500).json({
+    const isValidation = error instanceof SheetValidationError || error.name === 'SheetValidationError';
+    const status =
+      String(error.code) === '401' ? 401 : isValidation ? 400 : 500;
+
+    return res.status(status).json({
       ok: false,
       error: details,
       errors: error.errors || null,
