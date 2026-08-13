@@ -132,21 +132,21 @@ async function createInventoryItem(row, accounts, inventoryStartDate) {
     `${new Date().getUTCFullYear()}-${String(new Date().getUTCMonth() + 1).padStart(2, '0')}-01`;
 
   const sku = String(row.sku).trim();
-  const productName = String(row.productName || sku).trim();
 
   const payload = {
     // Put sheet SKU on the item itself (Name + Sku) so bill Product/Service shows the SKU.
     Name: sku,
     Sku: sku,
-    Description: productName,
-    PurchaseDesc: productName,
+    // Keep item descriptions empty so bill ItemBasedExpenseLineDetail Description stays blank.
+    Description: '',
+    PurchaseDesc: '',
     Type: 'Inventory',
     Taxable: false,
     IncomeAccountRef: { value: String(accounts.incomeAccount.Id) },
     ExpenseAccountRef: { value: String(accounts.expenseAccount.Id) },
     AssetAccountRef: { value: String(accounts.assetAccount.Id) },
     TrackQtyOnHand: true,
-    // Inventory must stay at zero — bill uses account lines and does not receive stock.
+    // Opening stock stays zero; bill receive qty is reversed afterward.
     QtyOnHand: 0,
     InvStartDate: asOfDate,
     UnitPrice: Number(row.unitPrice) || 0,
@@ -182,9 +182,8 @@ async function sparseUpdateItem(item, fields) {
   return refreshed || { ...item, ...fields };
 }
 
-async function ensureItemHasSku(item, sku, productName) {
+async function ensureItemHasSku(item, sku) {
   const wantedSku = String(sku || '').trim();
-  const wantedName = String(productName || wantedSku).trim();
   const currentSku = String(item.Sku || '').trim();
   const currentDesc = String(item.Description || '').trim();
   const currentPurchaseDesc = String(item.PurchaseDesc || '').trim();
@@ -193,11 +192,12 @@ async function ensureItemHasSku(item, sku, productName) {
   if (wantedSku && currentSku !== wantedSku) {
     fields.Sku = wantedSku;
   }
-  if (wantedName && !currentDesc) {
-    fields.Description = wantedName;
+  // Clear any prior descriptions so bill item-detail Description stays empty.
+  if (currentDesc) {
+    fields.Description = '';
   }
-  if (wantedName && !currentPurchaseDesc) {
-    fields.PurchaseDesc = wantedName;
+  if (currentPurchaseDesc) {
+    fields.PurchaseDesc = '';
   }
 
   if (!Object.keys(fields).length) {
@@ -237,7 +237,7 @@ async function ensureInventoryItems(rows, inventoryStartDate) {
       const taxResult = await ensureItemIsNonTaxable(item);
       item = taxResult.item;
 
-      const skuResult = await ensureItemHasSku(item, row.sku, row.productName);
+      const skuResult = await ensureItemHasSku(item, row.sku);
       item = skuResult.item;
 
       itemMap.set(row.sku, item);
@@ -278,12 +278,21 @@ async function ensureInventoryItems(rows, inventoryStartDate) {
   };
 }
 
-function buildBillPayload(parsedFile, vendorId, expenseAccountId, nonTaxableCode) {
-  // Account-based lines only — ItemBasedExpenseLineDetail would increase QtyOnHand.
-  // Inventory items are still created/updated separately with Sku and QtyOnHand = 0.
+function buildBillPayload(parsedFile, vendorId, itemMap, nonTaxableCode) {
+  // Product/Service item lines — Description must remain empty on every line.
   const lineItems = parsedFile.rows.map((row) => {
+    const item = itemMap.get(row.sku);
+    if (!item?.Id) {
+      throw new Error(`Missing QuickBooks item for SKU ${row.sku}`);
+    }
+
     const detail = {
-      AccountRef: { value: String(expenseAccountId) },
+      ItemRef: {
+        value: String(item.Id),
+        name: String(item.Name || row.sku),
+      },
+      Qty: row.quantity,
+      UnitPrice: row.cost,
       BillableStatus: 'NotBillable',
     };
 
@@ -294,8 +303,8 @@ function buildBillPayload(parsedFile, vendorId, expenseAccountId, nonTaxableCode
     return {
       Amount: row.amount,
       Description: '',
-      DetailType: 'AccountBasedExpenseLineDetail',
-      AccountBasedExpenseLineDetail: detail,
+      DetailType: 'ItemBasedExpenseLineDetail',
+      ItemBasedExpenseLineDetail: detail,
     };
   });
 
@@ -311,6 +320,45 @@ function buildBillPayload(parsedFile, vendorId, expenseAccountId, nonTaxableCode
   }
 
   return payload;
+}
+
+async function reverseBillQuantityToZero(parsedFile, itemMap, expenseAccountId) {
+  // Item-based bill lines increase QtyOnHand; reverse them so inventory stays at 0.
+  const qtyByItemId = new Map();
+
+  for (const row of parsedFile.rows) {
+    const item = itemMap.get(row.sku);
+    if (!item?.Id || !row.quantity) {
+      continue;
+    }
+
+    const itemId = String(item.Id);
+    qtyByItemId.set(itemId, (qtyByItemId.get(itemId) || 0) + Number(row.quantity));
+  }
+
+  const lines = [...qtyByItemId.entries()]
+    .filter(([, qty]) => qty > 0)
+    .map(([itemId, qty]) => ({
+      DetailType: 'ItemAdjustmentLineDetail',
+      Amount: 0,
+      ItemAdjustmentLineDetail: {
+        ItemRef: { value: itemId },
+        QtyDiff: -qty,
+      },
+    }));
+
+  if (!lines.length) {
+    return null;
+  }
+
+  const response = await qboRequest('POST', '/inventoryadjustment', {
+    AdjustAccountRef: { value: String(expenseAccountId) },
+    TxnDate: parsedFile.header.date || new Date().toISOString().slice(0, 10),
+    PrivateNote: `Reset QtyOnHand to 0 after bill ${parsedFile.header.ref || ''}`.trim(),
+    Line: lines,
+  });
+
+  return response.InventoryAdjustment || null;
 }
 
 async function findBillByDocNumber(docNumber) {
@@ -351,6 +399,7 @@ async function createBillFromParsedFile(parsedFile) {
 
   const { vendor, created: vendorCreated } = await findOrCreateVendor(parsedFile.header.vendor);
   const {
+    itemMap,
     createdItems,
     reusedItems,
     updatedTaxItems,
@@ -360,14 +409,10 @@ async function createBillFromParsedFile(parsedFile) {
     parsedFile.rows,
     parsedFile.header.inventoryStartDate || parsedFile.header.date
   );
-  const billPayload = buildBillPayload(
-    parsedFile,
-    vendor.Id,
-    accounts.expenseAccount.Id,
-    nonTaxableCode
-  );
+  const billPayload = buildBillPayload(parsedFile, vendor.Id, itemMap, nonTaxableCode);
   const billResponse = await qboRequest('POST', '/bill', billPayload);
   const bill = billResponse.Bill;
+  await reverseBillQuantityToZero(parsedFile, itemMap, accounts.expenseAccount.Id);
 
   return {
     vendor: {
