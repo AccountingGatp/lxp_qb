@@ -182,21 +182,32 @@ async function sparseUpdateItem(item, fields) {
   return refreshed || { ...item, ...fields };
 }
 
+async function fullUpdateItem(item, fields) {
+  // Sparse updates ignore empty strings, so clearing a field needs a full update.
+  const current = (await refetchItem(item.Id)) || item;
+  const response = await qboRequest('POST', `/item?operation=update`, {
+    ...current,
+    ...fields,
+    Id: current.Id,
+    SyncToken: current.SyncToken,
+  });
+
+  return response?.Item?.Id ? response.Item : { ...current, ...fields };
+}
+
 async function ensureItemHasSku(item, sku) {
   const wantedSku = String(sku || '').trim();
   const currentSku = String(item.Sku || '').trim();
-  const currentDesc = String(item.Description || '').trim();
-  const currentPurchaseDesc = String(item.PurchaseDesc || '').trim();
 
   const fields = {};
   if (wantedSku && currentSku !== wantedSku) {
     fields.Sku = wantedSku;
   }
-  // Clear any prior descriptions so bill item-detail Description stays empty.
-  if (currentDesc) {
+  // Wipe item descriptions — QBO copies these onto bill Item details lines.
+  if (String(item.Description || '') !== '') {
     fields.Description = '';
   }
-  if (currentPurchaseDesc) {
+  if (String(item.PurchaseDesc || '') !== '') {
     fields.PurchaseDesc = '';
   }
 
@@ -204,7 +215,7 @@ async function ensureItemHasSku(item, sku) {
     return { item, updated: false };
   }
 
-  const updatedItem = await sparseUpdateItem(item, fields);
+  const updatedItem = await fullUpdateItem(item, fields);
   return { item: updatedItem, updated: true };
 }
 
@@ -322,6 +333,31 @@ function buildBillPayload(parsedFile, vendorId, itemMap, nonTaxableCode) {
   return payload;
 }
 
+async function clearBillLineDescriptions(bill) {
+  if (!bill?.Id || bill.SyncToken === undefined || bill.SyncToken === null) {
+    return bill;
+  }
+
+  const sourceLines = Array.isArray(bill.Line) ? bill.Line : [];
+  const needsClearing = sourceLines.some(
+    (line) => String(line.Description || '') !== ''
+  );
+
+  if (!needsClearing) {
+    return bill;
+  }
+
+  // Full update — a sparse update would leave the auto-filled Description untouched.
+  const response = await qboRequest('POST', '/bill?operation=update', {
+    ...bill,
+    Id: bill.Id,
+    SyncToken: bill.SyncToken,
+    Line: sourceLines.map((line) => ({ ...line, Description: '' })),
+  });
+
+  return response.Bill || bill;
+}
+
 async function reverseBillQuantityToZero(parsedFile, itemMap, expenseAccountId) {
   // Item-based bill lines increase QtyOnHand; reverse them so inventory stays at 0.
   const qtyByItemId = new Map();
@@ -411,7 +447,8 @@ async function createBillFromParsedFile(parsedFile) {
   );
   const billPayload = buildBillPayload(parsedFile, vendor.Id, itemMap, nonTaxableCode);
   const billResponse = await qboRequest('POST', '/bill', billPayload);
-  const bill = billResponse.Bill;
+  let bill = billResponse.Bill;
+  bill = await clearBillLineDescriptions(bill);
   await reverseBillQuantityToZero(parsedFile, itemMap, accounts.expenseAccount.Id);
 
   return {
