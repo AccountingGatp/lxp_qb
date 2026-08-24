@@ -112,18 +112,53 @@ export default function Home() {
     setIsSubmitting(true);
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
+      const contentType =
+        file.type ||
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+
+      const presignResponse = await fetch(
+        `${API_BASE_URL}/api/uploads/b2/presign`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            fileName: file.name,
+            contentType,
+            fileSize: file.size,
+          }),
+        }
+      );
+
+      const presignData = await presignResponse.json();
+      if (!presignResponse.ok) {
+        throw new Error(presignData.error || "Could not start Backblaze upload.");
+      }
+
+      const putResponse = await fetch(presignData.uploadUrl, {
+        method: "PUT",
+        headers: { "Content-Type": presignData.contentType },
+        body: file,
+      });
+
+      if (!putResponse.ok) {
+        throw new Error(
+          `Backblaze upload failed (${putResponse.status}). Check bucket CORS and B2 credentials.`
+        );
+      }
 
       const response = await fetch(`${API_BASE_URL}/api/uploads/xlsx`, {
         method: "POST",
-        body: formData,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          key: presignData.key,
+          fileName: file.name,
+        }),
       });
 
       const data = await response.json();
       if (!response.ok) {
         const message = data.errors?.length
-          ? `${data.error}\n${data.errors.map((item) => `- ${item}`).join("\n")}`
+          ? `${(data.error || "Upload failed.").split("\n")[0]}\n${[...new Set(data.errors)].map((item) => `- ${item}`).join("\n")}`
           : data.error || "Upload failed.";
         if (data.reconnectUrl) {
           throw new Error(`${message} Reconnect at ${data.reconnectUrl}`);
@@ -149,7 +184,8 @@ export default function Home() {
           </h1>
           <p className="max-w-3xl text-sm text-muted-foreground">
             Connect QuickBooks first, then upload one spreadsheet to create
-            missing inventory and a vendor bill.
+            missing inventory and a vendor bill. Large files go to Backblaze
+            first so they are not blocked by the API size limit.
           </p>
         </div>
 
@@ -202,7 +238,7 @@ export default function Home() {
               <CardTitle>2. Upload Spreadsheet</CardTitle>
               <CardDescription>
                 {isConnected
-                  ? "Upload is enabled. The first worksheet will be synced to QuickBooks."
+                  ? "Upload is enabled. The file is sent to Backblaze, then synced to QuickBooks."
                   : "Connect QuickBooks first to unlock upload."}
               </CardDescription>
             </CardHeader>

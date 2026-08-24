@@ -11,27 +11,14 @@ class SheetValidationError extends Error {
 
 const EXPECTED_META_LABELS = ['Vendor', 'Date', 'Ref #', 'Invoice Amount'];
 
-const EXPECTED_COLUMNS = [
+const REQUIRED_COLUMNS = [
   'Product Name',
   'SKU #',
-  'Manufacturer',
-  'Type',
-  'Strain',
-  'Net Weight',
-  'Tier (If Applicable)',
-  'Genetics',
-  'Type ID',
-  'Mfg Date',
-  'Days',
-  'New Item',
   'Status',
-  'Inv Qty',
-  'Act. Qty',
   'Cost/Unit',
-  'Received Amount',
-  'Retail Price/Unit',
-  'Retail Value',
 ];
+
+const QUANTITY_COLUMNS = ['Act. Qty', 'Inv Qty'];
 
 const COLUMN_KEYS = {
   productname: 'productName',
@@ -41,7 +28,7 @@ const COLUMN_KEYS = {
   type: 'type',
   strain: 'strain',
   netweight: 'netWeight',
-  'tierifapplicable': 'tier',
+  tierifapplicable: 'tier',
   genetics: 'genetics',
   typeid: 'typeId',
   mfgdate: 'mfgDate',
@@ -49,12 +36,23 @@ const COLUMN_KEYS = {
   newitem: 'newItem',
   status: 'status',
   invqty: 'qty',
+  qty: 'qty',
   'act.qty': 'actQty',
+  actqty: 'actQty',
   'cost/unit': 'cost',
+  costunit: 'cost',
+  cost: 'cost',
   receivedamount: 'receivedAmount',
   'retailprice/unit': 'unitPrice',
+  retailpriceunit: 'unitPrice',
   retailvalue: 'retailValue',
 };
+
+const EXPECTED_COLUMNS = [
+  ...REQUIRED_COLUMNS,
+  'Act. Qty or Inv Qty',
+  'Received Amount',
+];
 
 function normalizeHeader(value) {
   return String(value || '')
@@ -177,60 +175,41 @@ function validateMeta(rows) {
     meta[normalizeHeader(label)] = found.value;
   });
 
-  // Reject unexpected first-column meta labels in the top block.
-  for (let i = 0; i < Math.min(rows.length, 4); i += 1) {
-    const label = displayHeader(String(rows[i][0] || '').replace(/:$/, ''));
-    if (!label) {
-      continue;
-    }
-
-    const allowed = EXPECTED_META_LABELS.some(
-      (expected) => normalizeHeader(expected) === normalizeHeader(label)
-    );
-    if (!allowed) {
-      errors.push(
-        `Unexpected header label "${label}" at row ${i + 1}. Expected one of: ${EXPECTED_META_LABELS.join(', ')}.`
-      );
-    }
-  }
-
   return { errors, meta };
-}
-
-function validateColumns(headerRow) {
-  const errors = [];
-  const actual = headerRow
-    .map((cell) => displayHeader(cell))
-    .filter((cell) => cell !== '');
-
-  const expectedNormalized = EXPECTED_COLUMNS.map(normalizeHeader);
-  const actualNormalized = actual.map(normalizeHeader);
-
-  if (actualNormalized.length !== expectedNormalized.length) {
-    errors.push(
-      `Column count mismatch. Expected ${EXPECTED_COLUMNS.length} columns, found ${actualNormalized.length}.`
-    );
-  }
-
-  expectedNormalized.forEach((expected, index) => {
-    const actualValue = actualNormalized[index];
-    if (actualValue !== expected) {
-      errors.push(
-        `Column ${index + 1} mismatch. Expected "${EXPECTED_COLUMNS[index]}", found "${actual[index] || '(missing)'}".`
-      );
-    }
-  });
-
-  // Extra unexpected columns beyond expected length
-  for (let i = expectedNormalized.length; i < actualNormalized.length; i += 1) {
-    errors.push(`Unexpected extra column ${i + 1}: "${actual[i]}".`);
-  }
-
-  return errors;
 }
 
 function mapHeaderKeys(headerRow) {
   return headerRow.map((cell) => COLUMN_KEYS[normalizeHeader(displayHeader(cell))] || null);
+}
+
+function validateRequiredColumns(headerRow) {
+  const mapped = mapHeaderKeys(headerRow);
+  const present = new Set(mapped.filter(Boolean));
+  const errors = [];
+
+  if (!present.has('productName')) {
+    errors.push('Missing required column "Product Name".');
+  }
+  if (!present.has('sku')) {
+    errors.push('Missing required column "SKU #" (or "SKU").');
+  }
+  if (!present.has('status')) {
+    errors.push('Missing required column "Status".');
+  }
+  if (!present.has('cost')) {
+    errors.push('Missing required column "Cost/Unit".');
+  }
+  if (!present.has('actQty') && !present.has('qty')) {
+    errors.push('Missing quantity column. Need "Act. Qty" or "Inv Qty".');
+  }
+
+  if (errors.length) {
+    errors.push(
+      `Required columns (any order): ${REQUIRED_COLUMNS.join(', ')}, plus ${QUANTITY_COLUMNS.join(' or ')}.`
+    );
+  }
+
+  return errors;
 }
 
 function extractRows(rows, headerIndex) {
@@ -253,7 +232,7 @@ function extractRows(rows, headerIndex) {
 
     const rowObject = {};
     mappedHeaders.forEach((key, index) => {
-      if (key) {
+      if (key && rowObject[key] === undefined) {
         rowObject[key] = rawRow[index];
       }
     });
@@ -294,7 +273,7 @@ function extractRows(rows, headerIndex) {
     const receivedAmount = parseNumber(rowObject.receivedAmount);
 
     if (!quantity || quantity <= 0) {
-      errors.push(`Row ${i + 1} (SKU ${sku}): Act. Qty / Inv Qty must be a positive number.`);
+      errors.push(`Row ${i + 1} (SKU ${sku}): Act. Qty or Inv Qty must be a positive number.`);
       continue;
     }
 
@@ -302,6 +281,11 @@ function extractRows(rows, headerIndex) {
       errors.push(`Row ${i + 1} (SKU ${sku}): Cost/Unit must be a valid number.`);
       continue;
     }
+
+    const amount =
+      receivedAmount === null
+        ? Number((quantity * cost).toFixed(2))
+        : Number(receivedAmount.toFixed(2));
 
     dataRows.push({
       rowNumber: i + 1,
@@ -312,7 +296,7 @@ function extractRows(rows, headerIndex) {
       unitPrice,
       retailValue,
       receivedAmount,
-      amount: Number((quantity * cost).toFixed(2)),
+      amount,
       status,
       raw: rowObject,
     });
@@ -353,13 +337,7 @@ function parseWorkbook(buffer) {
     throw new SheetValidationError(validationErrors);
   }
 
-  if (headerIndex !== 4) {
-    validationErrors.push(
-      `Product table header must be on row 5. Found header on row ${headerIndex + 1}.`
-    );
-  }
-
-  validationErrors.push(...validateColumns(rows[headerIndex]));
+  validationErrors.push(...validateRequiredColumns(rows[headerIndex]));
 
   const vendor = String(meta.vendor || '').trim();
   const ref = String(meta.ref || '').trim();
@@ -415,5 +393,6 @@ module.exports = {
   parseWorkbook,
   SheetValidationError,
   EXPECTED_COLUMNS,
+  REQUIRED_COLUMNS,
   EXPECTED_META_LABELS,
 };

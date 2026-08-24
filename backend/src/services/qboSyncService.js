@@ -91,6 +91,11 @@ async function getNonTaxableCode() {
   }
 }
 
+function clipItemName(value, fallback) {
+  const name = String(value || fallback || 'Inventory Item').trim();
+  return name.slice(0, 100);
+}
+
 async function findInventoryItem(row) {
   const sku = String(row.sku || '').trim();
   const productName = String(row.productName || '').trim();
@@ -132,12 +137,13 @@ async function createInventoryItem(row, accounts, inventoryStartDate) {
     `${new Date().getUTCFullYear()}-${String(new Date().getUTCMonth() + 1).padStart(2, '0')}-01`;
 
   const sku = String(row.sku).trim();
+  const productName = clipItemName(row.productName, sku);
 
   const payload = {
-    // Put sheet SKU on the item itself (Name + Sku) so bill Product/Service shows the SKU.
-    Name: sku,
+    // Product/Service on the bill uses Item.Name — use sheet product name.
+    // Keep sheet SKU on the Sku field.
+    Name: productName,
     Sku: sku,
-    // Keep item descriptions empty so bill ItemBasedExpenseLineDetail Description stays blank.
     Description: '',
     PurchaseDesc: '',
     Type: 'Inventory',
@@ -153,9 +159,24 @@ async function createInventoryItem(row, accounts, inventoryStartDate) {
     PurchaseCost: Number(row.cost) || 0,
   };
 
-  const response = await qboRequest('POST', '/item', payload);
-  const item = response.Item;
+  try {
+    const response = await qboRequest('POST', '/item', payload);
+    return assertZeroQty(response.Item, sku);
+  } catch (error) {
+    const detail = String(error.detail || error.message || '');
+    if (!/duplicate|already exists|unique/i.test(detail)) {
+      throw error;
+    }
 
+    const retry = await qboRequest('POST', '/item', {
+      ...payload,
+      Name: clipItemName(`${productName} (${sku})`, sku),
+    });
+    return assertZeroQty(retry.Item, sku);
+  }
+}
+
+function assertZeroQty(item, sku) {
   if (item && Number(item.QtyOnHand) !== 0) {
     throw new Error(
       `Inventory item for SKU ${sku} was created with QtyOnHand=${item.QtyOnHand}; expected 0.`
@@ -195,15 +216,19 @@ async function fullUpdateItem(item, fields) {
   return response?.Item?.Id ? response.Item : { ...current, ...fields };
 }
 
-async function ensureItemHasSku(item, sku) {
+async function ensureItemMatchesSheet(item, sku, productName) {
   const wantedSku = String(sku || '').trim();
+  const wantedName = clipItemName(productName, wantedSku);
   const currentSku = String(item.Sku || '').trim();
+  const currentName = String(item.Name || '').trim();
 
   const fields = {};
   if (wantedSku && currentSku !== wantedSku) {
     fields.Sku = wantedSku;
   }
-  // Wipe item descriptions — QBO copies these onto bill Item details lines.
+  if (wantedName && currentName !== wantedName) {
+    fields.Name = wantedName;
+  }
   if (String(item.Description || '') !== '') {
     fields.Description = '';
   }
@@ -215,8 +240,19 @@ async function ensureItemHasSku(item, sku) {
     return { item, updated: false };
   }
 
-  const updatedItem = await fullUpdateItem(item, fields);
-  return { item: updatedItem, updated: true };
+  try {
+    const updatedItem = await fullUpdateItem(item, fields);
+    return { item: updatedItem, updated: true };
+  } catch (error) {
+    const detail = String(error.detail || error.message || '');
+    if (!fields.Name || !/duplicate|already exists|unique/i.test(detail)) {
+      throw error;
+    }
+
+    const fallbackName = clipItemName(`${wantedName} (${wantedSku})`, wantedSku);
+    const updatedItem = await fullUpdateItem(item, { ...fields, Name: fallbackName });
+    return { item: updatedItem, updated: true };
+  }
 }
 
 async function ensureItemIsNonTaxable(item) {
@@ -248,7 +284,7 @@ async function ensureInventoryItems(rows, inventoryStartDate) {
       const taxResult = await ensureItemIsNonTaxable(item);
       item = taxResult.item;
 
-      const skuResult = await ensureItemHasSku(item, row.sku);
+      const skuResult = await ensureItemMatchesSheet(item, row.sku, row.productName);
       item = skuResult.item;
 
       itemMap.set(row.sku, item);
@@ -300,7 +336,7 @@ function buildBillPayload(parsedFile, vendorId, itemMap, nonTaxableCode) {
     const detail = {
       ItemRef: {
         value: String(item.Id),
-        name: String(item.Name || row.sku),
+        name: String(item.Name || row.productName || row.sku),
       },
       Qty: row.quantity,
       UnitPrice: row.cost,
