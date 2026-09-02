@@ -155,8 +155,8 @@ async function createInventoryItem(row, accounts, inventoryStartDate) {
     // Opening stock stays zero; bill receive qty is reversed afterward.
     QtyOnHand: 0,
     InvStartDate: asOfDate,
-    UnitPrice: Number(row.unitPrice) || 0,
-    PurchaseCost: Number(row.cost) || 0,
+    UnitPrice: 0,
+    PurchaseCost: 0,
   };
 
   try {
@@ -234,6 +234,12 @@ async function ensureItemMatchesSheet(item, sku, productName) {
   }
   if (String(item.PurchaseDesc || '') !== '') {
     fields.PurchaseDesc = '';
+  }
+  if (Number(item.UnitPrice) !== 0) {
+    fields.UnitPrice = 0;
+  }
+  if (Number(item.PurchaseCost) !== 0) {
+    fields.PurchaseCost = 0;
   }
 
   if (!Object.keys(fields).length) {
